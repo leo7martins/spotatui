@@ -280,11 +280,6 @@ impl CliApp {
   }
 
   pub async fn seek(&mut self, seconds_str: String) -> Result<()> {
-    let seconds = match seconds_str.parse::<i32>() {
-      Ok(s) => s.unsigned_abs(),
-      Err(_) => return Err(anyhow!("failed to convert seconds to i32")),
-    };
-
     let (current_pos, duration) = {
       self
         .net
@@ -309,20 +304,9 @@ impl CliApp {
       }
     };
 
-    // Convert secs to ms
-    let ms = seconds * 1000;
-    // Calculate new positon
-    let position_to_seek = if seconds_str.starts_with('+') {
-      current_pos + ms
-    } else if seconds_str.starts_with('-') {
-      // Jump to the beginning if the position_to_seek would be
-      // negative, must be checked before the calculation to avoid
-      // an 'underflow'
-      current_pos.saturating_sub(ms)
-    } else {
-      // Absolute value of the track
-      seconds * 1000
-    };
+    // clap's `parse_seek_seconds` already refused a value that is not whole
+    // seconds, so this error is a safety net, not a path users reach
+    let position_to_seek = seek_target(&seconds_str, current_pos)?;
 
     // Check if position_to_seek is greater than duration (next track)
     if position_to_seek > duration {
@@ -833,11 +817,31 @@ fn playable_format_type(item: PlayableInfo) -> FormatType {
   }
 }
 
+/// The position in milliseconds that `playback --seek` asks for: `+N` and `-N`
+/// move N seconds from `current_pos`, and a bare `N` goes to second N. The math
+/// saturates, so a huge value lands past the end of the track, where `seek`
+/// skips to the next one, instead of wrapping around to its start.
+fn seek_target(seconds_str: &str, current_pos: u32) -> Result<u32> {
+  let seconds = seconds_str
+    .parse::<i32>()
+    .map_err(|_| anyhow!("expected whole seconds, for example +10, -10 or 10"))?
+    .unsigned_abs();
+  let ms = seconds.saturating_mul(1000);
+  Ok(if seconds_str.starts_with('+') {
+    current_pos.saturating_add(ms)
+  } else if seconds_str.starts_with('-') {
+    // A backward seek past the start goes to the start
+    current_pos.saturating_sub(ms)
+  } else {
+    ms
+  })
+}
+
 #[cfg(test)]
 mod tests {
   use super::{
     device_id_by_name, first_result_uri, parse_query_limit, parse_track_limit,
-    playable_format_type, playlist_items_total, random_offset, SearchResult, Type,
+    playable_format_type, playlist_items_total, random_offset, seek_target, SearchResult, Type,
   };
   use crate::cli::util::{render_format, Format};
   use crate::core::plugin_api::{EpisodeInfo, PlayableInfo};
@@ -847,6 +851,28 @@ mod tests {
   fn a_track_limit_has_no_page_ceiling() {
     assert_eq!(parse_track_limit("1").unwrap(), 1);
     assert_eq!(parse_track_limit("500").unwrap(), 500);
+  }
+
+  #[test]
+  fn seek_target_saturates_instead_of_overflowing() {
+    let pos = 60_000;
+    // 4294968 s is more than u32::MAX ms
+    assert_eq!(seek_target("4294968", pos).unwrap(), u32::MAX);
+    assert_eq!(seek_target("+4294968", pos).unwrap(), u32::MAX);
+    assert_eq!(seek_target("+4294967", u32::MAX - 10).unwrap(), u32::MAX);
+    // i32::MIN has an unsigned_abs of 2147483648
+    assert_eq!(seek_target("-2147483648", pos).unwrap(), 0);
+    assert_eq!(seek_target("+10", pos).unwrap(), 70_000);
+    assert_eq!(seek_target("-10", pos).unwrap(), 50_000);
+    assert_eq!(seek_target("-90", pos).unwrap(), 0);
+    assert_eq!(seek_target("10", pos).unwrap(), 10_000);
+  }
+
+  #[test]
+  fn seek_target_refuses_a_value_that_is_not_whole_seconds() {
+    for seconds in ["ten", "1.5", "+", ""] {
+      assert!(seek_target(seconds, 0).is_err(), "{seconds:?}");
+    }
   }
 
   #[test]
